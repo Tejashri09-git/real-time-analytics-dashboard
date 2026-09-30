@@ -24,3 +24,10 @@ To build a cloud-based real-time analytics system for processing and analyzing e
 
 ## Current Stage
 Step 3 – IaC Setup
+
+## Future Scope
+- Deploy the e-commerce shopping website on EC2
+- Connect the website with the AWS backend
+- Develop the admin analytics dashboard
+- Add security and monitoring
+- Perform testing and cost optimization
