@@ -1,0 +1,324 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Real-time Analytics Dashboard on Cloud - IaC
+
+Parameters:
+  SSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+
+Resources:
+  AnalyticsVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: RealTimeAnalytics-VPC
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AnalyticsVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: RealTimeAnalytics-PublicSubnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref AnalyticsVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AnalyticsVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for website
+      VpcId: !Ref AnalyticsVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  WebsiteServer:
+    Type: AWS::EC2::Instance
+    DependsOn: AttachGateway
+    Properties:
+      InstanceType: t3.micro
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y httpd
+          systemctl enable httpd
+          systemctl start httpd
+          echo '<h1>ShopEasy - Real-time Analytics</h1><p>Website deployed using CloudFormation.</p>' > /var/www/html/index.html
+
+  RawOrdersBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${RawOrdersBucket.Arn}/*'
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt OrdersTable.Arn
+
+  OrderReceiverLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref RawOrdersBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime, timezone
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+              body = event.get('body', event)
+              if isinstance(body, str):
+                  body = json.loads(body)
+              order_id = body.get('orderId', 'ORD-' + uuid.uuid4().hex[:8].upper())
+              order = {
+                  'orderId': order_id,
+                  'customerName': body.get('customerName', 'Customer'),
+                  'product': body.get('product', 'Product'),
+                  'quantity': int(body.get('quantity', 1)),
+                  'amount': float(body.get('amount', 0)),
+                  'city': body.get('city', 'Pune'),
+                  'timestamp': datetime.now(timezone.utc).isoformat()
+              }
+              s3.put_object(
+                  Bucket=os.environ['BUCKET_NAME'],
+                  Key='orders/' + order_id + '.json',
+                  Body=json.dumps(order),
+                  ContentType='application/json'
+              )
+              return {'statusCode': 200, 'body': json.dumps({'message': 'Order received', 'orderId': order_id})}
+
+  OrderProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from urllib.parse import unquote_plus
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          def lambda_handler(event, context):
+              detail = event.get('detail', {})
+              bucket = detail.get('bucket', {}).get('name')
+              key = detail.get('object', {}).get('key')
+              if not bucket or not key:
+                  return {'statusCode': 200, 'body': 'No S3 object information'}
+              key = unquote_plus(key)
+              obj = s3.get_object(Bucket=bucket, Key=key)
+              data = json.loads(obj['Body'].read().decode('utf-8'))
+              dynamodb.Table(os.environ['TABLE_NAME']).put_item(Item={
+                  'orderId': str(data.get('orderId')),
+                  'customerName': str(data.get('customerName', '')),
+                  'product': str(data.get('product', '')),
+                  'quantity': int(data.get('quantity', 0)),
+                  'amount': float(data.get('amount', 0)),
+                  'city': str(data.get('city', '')),
+                  'timestamp': str(data.get('timestamp', ''))
+              })
+              return {'statusCode': 200, 'body': 'Order processed'}
+
+  OrdersApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: RealTimeAnalytics-Orders-API
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - '*'
+
+  OrdersIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref OrdersApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt OrderReceiverLambda.Arn
+      PayloadFormatVersion: '2.0'
+
+  OrdersRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref OrdersApi
+      RouteKey: POST /orders
+      Target: !Sub integrations/${OrdersIntegration}
+
+  OrdersStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref OrdersApi
+      StageName: $default
+      AutoDeploy: true
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OrderReceiverLambda
+      Principal: apigateway.amazonaws.com
+
+  S3OrderEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref RawOrdersBucket
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrderProcessorLambda.Arn
+          Id: OrderProcessorTarget
+
+  LambdaEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OrderProcessorLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3OrderEventRule.Arn
+
+Outputs:
+  WebsiteURL:
+    Value: !Sub 'http://${WebsiteServer.PublicIp}'
+  EC2InstanceId:
+    Value: !Ref WebsiteServer
+  S3BucketName:
+    Value: !Ref RawOrdersBucket
+  DynamoDBTableName:
+    Value: !Ref OrdersTable
+  Lambda1Name:
+    Value: !Ref OrderReceiverLambda
+  Lambda2Name:
+    Value: !Ref OrderProcessorLambda
+  APIEndpoint:
+    Value: !Sub '${OrdersApi.ApiEndpoint}/orders'
